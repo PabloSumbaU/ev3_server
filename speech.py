@@ -1,35 +1,50 @@
-import threading
-import sockets
-import time
-from utils import speak_es
+"""Canal de voz: la app envia texto y el robot lo dice y lo muestra en pantalla.
 
-def speak():
+Funciona con la funcion "Repetir lo que digo" y con el cuadro de texto de la
+app (escribir lo que dira el robot).
+Compatible con Python 3.5.
+"""
+import threading
+import time
+
+import sockets
+import personality as p
+import behaviors
+from utils import debug_print
+
+
+def _loop():
+    reader, conn = None, None
     while True:
         try:
-            # Comprobar que el socket existe antes de intentar recibir
-            if not hasattr(sockets.receivers, 'speech') or sockets.receivers.speech is None:
-                time.sleep(0.5)
+            current = sockets.current
+            if current is None or not current.alive:
+                reader, conn = None, None
+                time.sleep(0.3)
                 continue
+            if current is not conn:
+                conn, reader = current, sockets.MessageReader(current.speech)
 
-            data = sockets.receivers.speech.recv(1024)
-            if not data:
-                time.sleep(0.1)
+            messages = reader.read()
+            if messages is None:          # la app cerro el socket
+                reader = None
+                time.sleep(0.3)
                 continue
-            
-            text = data.decode('utf-8', errors='ignore').strip()
-            
-            if '|' in text:
-                text = text.split('|')[0]
-            
-            if text:
-                print("[Speech Socket] Hablando: '{}'".format(text))
-                speak_es(text)
-
+            for text in messages:
+                text = text.strip()
+                if not text:
+                    continue
+                if behaviors.state.sleeping:
+                    behaviors.state.sleeping = False
+                    p.emote("neutral")
+                p.say(text)
         except Exception as e:
-            print("[Speech Socket] Error de lectura (recuperable): {}".format(e))
+            debug_print("[Voz] Error recuperable: " + str(e))
+            reader, conn = None, None
             time.sleep(0.5)
 
+
 def start():
-    speech_thread = threading.Thread(target=speak)
-    speech_thread.daemon = True
-    speech_thread.start()
+    t = threading.Thread(target=_loop)
+    t.daemon = True
+    t.start()
