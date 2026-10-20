@@ -108,3 +108,14 @@ Si algo falla, revisa `log.txt` en la misma carpeta: ahí quedan todos los mensa
 Sin el robot físico, se probó con un simulador de `ev3dev2` y una app simulada que se conecta por los 4 puertos. Pasaron 27 pruebas: joystick con mensajes partidos y pegados, garra, secuencias de voz, los 8 comportamientos, cancelación, freno de seguridad, saludo automático, dormir/despertar, desconexión y reconexión. Las caras se renderizaron con las fuentes reales del EV3 (tildes, ñ y ¡¿ incluidas). El código es compatible con Python 3.5 (el de ev3dev stretch).
 
 **Pendiente de verificar en el robot real:** sentido de giro, calibración de giros, volumen de la voz y que la variante de voz funcione.
+
+## Arreglo: acciones que se trababan (prueba en el robot real)
+
+En el EV3, Python 3.5 corre a veces sin locale UTF-8. Al escribir en el log un texto con `¡`, `¿`, tildes o `ñ` se lanzaba `UnicodeEncodeError` justo antes de hablar, y el robot quedaba marcado como "hablando" para siempre. Por eso Respirar funcionaba (sus frases no tienen tildes) y Saludar, Bailar, Chiste, Piedra-papel-tijera, Dormir y Despertar se trababan o no hacían nada.
+
+Arreglo:
+- `log.txt` se escribe en UTF-8 y el log nunca lanza errores de codificación.
+- La voz llama a `espeak` directamente con el texto en bytes UTF-8 (antes `ev3dev2` lo pasaba por la shell).
+- `Voice.say` siempre libera el estado "hablando", pase lo que pase.
+
+Se reprodujo el error simulando un sistema ASCII y las 27 pruebas pasan en ese modo.
