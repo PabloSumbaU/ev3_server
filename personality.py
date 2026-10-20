@@ -11,7 +11,10 @@ Las caras se dibujan una sola vez al arrancar y despues solo se pegan en la
 pantalla, porque dibujar con PIL en el EV3 es lento.
 Compatible con Python 3.5.
 """
+import os
 import random
+import shlex
+import subprocess
 import threading
 import time
 import unicodedata
@@ -490,9 +493,29 @@ class Voice:
         try:
             from ev3dev2.sound import Sound
             self.sound = Sound()
+            try:
+                self.sound.set_volume(100)
+            except Exception:
+                pass
         except Exception as e:
             debug_print("Sonido no disponible: " + str(e))
             self.sound = None
+
+    def _speak_raw(self, text):
+        '''Llama a espeak directamente con el texto en bytes UTF-8.
+
+        ev3dev2.Sound.speak arma un comando de shell con el texto, y eso falla
+        con tildes cuando el sistema no esta en UTF-8 (y con apostrofos).
+        '''
+        if os.path.exists("/usr/bin/espeak") and os.path.exists("/usr/bin/aplay"):
+            args = [b"/usr/bin/espeak", b"--stdout"] + [a.encode("utf-8") for a in shlex.split(config.VOICE_OPTS)]
+            espeak = subprocess.Popen(args + [text.encode("utf-8")], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            aplay = subprocess.Popen([b"/usr/bin/aplay", b"-q"], stdin=espeak.stdout, stderr=subprocess.DEVNULL)
+            espeak.stdout.close()
+            aplay.wait()
+            espeak.wait()
+        elif self.sound is not None:
+            self.sound.speak(text, espeak_opts=config.VOICE_OPTS)
 
     def say(self, text, wait=True, show=True):
         # ev3dev2 pasa el texto a la shell entre comillas simples: un apostrofo lo rompe
@@ -506,15 +529,19 @@ class Voice:
             return
         with self._lock:
             self.speaking = True
-            if show:
-                self.face.show_text(text)
-            debug_print("[Voz] " + text)
             try:
-                if self.sound is not None and not self.muted:
-                    self.sound.speak(text, espeak_opts=config.VOICE_OPTS)
+                if show:
+                    self.face.show_text(text)
+                debug_print("[Voz] " + text)
+                if not self.muted:
+                    self._speak_raw(text)
             except Exception as e:
-                debug_print("Error al hablar: " + str(e))
+                try:
+                    debug_print("Error al hablar: " + repr(e))
+                except Exception:
+                    pass
             finally:
+                # pase lo que pase, el robot nunca queda marcado como "hablando"
                 self.speaking = False
                 if show:
                     self.face.show_text(text, seconds=1.5)

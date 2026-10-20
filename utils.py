@@ -20,9 +20,19 @@ class _ErrorPrinter:
         self.files = files
 
     def write(self, obj):
+        # El EV3 a veces corre sin locale UTF-8 (Python 3.5 usa ASCII): un texto
+        # con tildes o "¡" lanzaba UnicodeEncodeError y trababa al robot.
         for f in self.files:
-            f.write(obj)
-            f.flush()
+            try:
+                f.write(obj)
+            except UnicodeEncodeError:
+                f.write(obj.encode("ascii", "replace").decode("ascii"))
+            except Exception:
+                pass
+            try:
+                f.flush()
+            except Exception:
+                pass
 
     def flush(self):
         for f in self.files:
@@ -36,7 +46,7 @@ try:
         os.replace("log.txt", "log_anterior.txt")
 except OSError:
     pass
-_log_file = open("log.txt", 'w')
+_log_file = open("log.txt", 'w', encoding="utf-8", errors="replace")
 _printer = _ErrorPrinter(sys.stderr, _log_file)
 sys.stderr = _printer
 
