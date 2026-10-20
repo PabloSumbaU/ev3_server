@@ -586,3 +586,18 @@ def show_waiting_screen(ips):
             y += 24
     face.show_custom(draw_fn)
     lights.pulse("AMBER", 2.5)
+
+
+def show_message(title, message):
+    """Pantalla de aviso (errores, puertos ocupados...)."""
+    def draw_fn(draw, w, h):
+        big, small = _font(18), _font(12)
+        tw = text_size(draw, title, big)[0]
+        draw_text_safe(draw, ((w - tw) // 2, 8), title, big)
+        y = 40
+        for line in wrap_text(draw, message, small, w - 10):
+            tw = text_size(draw, line, small)[0]
+            draw_text_safe(draw, ((w - tw) // 2, y), line, small)
+            y += 16
+    face.show_custom(draw_fn)
+    lights.steady("RED")

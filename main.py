@@ -11,6 +11,7 @@
 Compatible con Python 3.5 (ev3dev stretch).
 """
 import time
+import traceback
 
 import config
 import sockets
@@ -60,14 +61,19 @@ def process(messages):
             continue
         mode, payload = msg.split(":", 1)
         mode = mode.strip()
-        if mode == "stick":
-            if i == last_stick:
-                handle_stick(payload)
-        elif mode == "text":
-            debug_print("Comando: " + payload)
-            commands.handle_text(payload)
-        else:
-            debug_print("Modo desconocido: " + mode)
+        # Un error en un mensaje nunca debe cerrar el servidor: se registra y se sigue.
+        try:
+            if mode == "stick":
+                if i == last_stick:
+                    handle_stick(payload)
+            elif mode == "text":
+                debug_print("Comando: " + payload)
+                commands.handle_text(payload)
+            else:
+                debug_print("Modo desconocido: " + mode)
+        except Exception:
+            debug_print("ERROR procesando '" + msg + "':")
+            debug_print(traceback.format_exc())
 
 
 def session(conn):
@@ -85,7 +91,15 @@ def session(conn):
 def main():
     set_cursor(False)
     p.start()
-    sockets.initialize()
+    while True:
+        try:
+            sockets.initialize()
+            break
+        except OSError as e:
+            # Casi siempre: otro main.py sigue corriendo y ocupa los puertos.
+            debug_print("No se pudieron abrir los puertos: " + str(e))
+            p.show_message("Puertos ocupados", "¿Hay otro main.py abierto? Reintentando...")
+            time.sleep(3)
     mv.start()
     sensors.start()
     speech.start()
@@ -98,13 +112,22 @@ def main():
             session(conn)
         except (OSError, ConnectionError) as e:
             debug_print("Conexion perdida: " + str(e))
+        except Exception:
+            debug_print("ERROR en la sesion:")
+            debug_print(traceback.format_exc())
         finally:
-            mv.stop_all()
-            mv.set_claw(False)
+            try:
+                mv.stop_all()
+                mv.set_claw(False)
+            except Exception:
+                debug_print(traceback.format_exc())
             sockets.drop_current()
             behaviors.state.sleeping = False
-            p.emote("sad")
-            p.say("Me desconecté. Te espero.", wait=True)
+            try:
+                p.emote("sad")
+                p.say("Me desconecté. Te espero.", wait=True)
+            except Exception:
+                debug_print(traceback.format_exc())
             time.sleep(0.5)
 
 
@@ -113,6 +136,14 @@ if __name__ == '__main__':
         main()
     except KeyboardInterrupt:
         pass
+    except Exception:
+        debug_print("ERROR FATAL:")
+        debug_print(traceback.format_exc())
+        try:
+            p.show_message("Error", "Revisa log.txt")
+            time.sleep(5)
+        except Exception:
+            pass
     finally:
         try:
             mv.stop_all()

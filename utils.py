@@ -29,6 +29,13 @@ class _ErrorPrinter:
             f.flush()
 
 
+# El log anterior se guarda como log_anterior.txt (antes se borraba al reiniciar
+# y se perdia el error que habia cerrado el programa).
+try:
+    if os.path.exists("log.txt"):
+        os.replace("log.txt", "log_anterior.txt")
+except OSError:
+    pass
 _log_file = open("log.txt", 'w')
 _printer = _ErrorPrinter(sys.stderr, _log_file)
 sys.stderr = _printer
@@ -39,7 +46,8 @@ def debug_print(*args, **kwargs):
 
     En VS Code aparece en el panel de salida.
     '''
-    print(*args, file=sys.stderr, **kwargs)
+    import time
+    print(time.strftime("%H:%M:%S"), *args, file=sys.stderr, **kwargs)
 
 
 def reset_console():

@@ -77,8 +77,14 @@ def initialize():
     '''Crea los sockets de escucha (una sola vez).'''
     if _listeners:
         return
-    for port in (config.PORT_MAIN, config.PORT_SENSOR, config.PORT_SPEECH, config.PORT_POSITION):
-        _listeners.append(_listener(port))
+    try:
+        for port in (config.PORT_MAIN, config.PORT_SENSOR, config.PORT_SPEECH, config.PORT_POSITION):
+            _listeners.append(_listener(port))
+    except OSError:
+        for s in _listeners:
+            s.close()
+        del _listeners[:]
+        raise
     debug_print("Servidor escuchando en puertos " + str(config.PORT_MAIN) + "-" + str(config.PORT_POSITION))
 
 
