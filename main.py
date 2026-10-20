@@ -1,69 +1,121 @@
 #!/usr/bin/env python3
+"""Programa principal del robot social EV3.
 
+1. Muestra la cara y la IP en la pantalla mientras espera la app.
+2. Cuando la app se conecta, saluda y procesa los mensajes:
+     "stick:<x>;<y>;<garra>"   joystick (garra = 1 cerrada / 0 abierta)
+     "stick:*;<garra>"         se solto el joystick
+     "text:<instrucciones>"    comandos de voz y botones (ver commands.py)
+3. Si la app se desconecta, el robot vuelve a esperar (ya no hace falta
+   reiniciar main.py para volver a conectar).
+Compatible con Python 3.5 (ev3dev stretch).
+"""
+import time
+
+import config
 import sockets
+import personality as p
+import movement as mv
+import commands
 import sensors
 import speech
-import movement
+import behaviors
+from utils import debug_print, get_ip_addresses, set_cursor
 
-from utils import *
+
+def handle_stick(payload):
+    parts = payload.split(";")
+    if not parts:
+        return
+    if parts[0].strip() == "*":
+        # "*" llega al soltar el joystick y tambien al tocar el boton de la garra:
+        # solo detenemos las ruedas si el joystick las estaba moviendo.
+        if mv.state.joystick_active:
+            mv.joystick_stop()
+        claw = parts[1] if len(parts) > 1 else None
+    else:
+        try:
+            x = float(parts[0])
+            y = float(parts[1])
+        except (ValueError, IndexError):
+            debug_print("Joystick invalido: " + payload)
+            return
+        if behaviors.state.sleeping and (x or y):
+            behaviors.state.sleeping = False
+            p.emote("neutral")
+        mv.joystick(x, y)
+        claw = parts[2] if len(parts) > 2 else None
+    if claw is not None and claw.strip() in ("0", "1"):
+        mv.set_claw(claw.strip() == "1")
+
+
+def process(messages):
+    # Del joystick solo importa el ultimo mensaje de cada lote.
+    last_stick = None
+    for i, msg in enumerate(messages):
+        if msg.startswith("stick:"):
+            last_stick = i
+    for i, msg in enumerate(messages):
+        if ":" not in msg:
+            continue
+        mode, payload = msg.split(":", 1)
+        mode = mode.strip()
+        if mode == "stick":
+            if i == last_stick:
+                handle_stick(payload)
+        elif mode == "text":
+            debug_print("Comando: " + payload)
+            commands.handle_text(payload)
+        else:
+            debug_print("Modo desconocido: " + mode)
+
+
+def session(conn):
+    p.face.clear_custom()
+    p.emote("happy")
+    p.say("¡Hola! Soy " + config.ROBOT_NAME + ". ¡Estoy listo para jugar!", wait=False)
+    reader = sockets.MessageReader(conn.client)
+    while conn.alive:
+        messages = reader.read()
+        if messages is None:
+            break
+        process(messages)
+
 
 def main():
-    reset_console()
     set_cursor(False)
-    set_font('Lat15-Terminus24x12')
-
+    p.start()
     sockets.initialize()
-
-    reset_console()
-    print("Iniciando...")
-    speak_es("Conectado")
-
+    mv.start()
     sensors.start()
     speech.start()
-    movement.start_tracking()
-
-    reset_console()
-    print("")
 
     while True:
-        data = sockets.receivers.client.recv(1024)
-
-        if not data:
-            break
-
-        data = data.decode()
-
-        data = data.split(sockets.message_end)[-2]
-        data = data.split(":")
-
-        mode = data[0]
-        data = "".join(data[1:])
-
-        debug_print("mode:" + mode + " data:" + data)
-
-        if mode == "text":
-            data = data.split(";")
-
-            for instruction in data:
-                movement.interpret(instruction)
-
-            continue
-
-
-        if "*" in data:
-            movement.stop()
-            is_clawing_time = data[data.index("*") + 2] == "1"
-        else:
-            joy_x = float(data[0:5])
-            joy_y = float(data[6:11])
-            is_clawing_time = data[12] == "1"
-            movement.joystick(joy_x, joy_y)
-
-        movement.claw(is_clawing_time)
+        p.show_waiting_screen(get_ip_addresses())
+        p.voice.beep()
+        conn = sockets.wait_for_client()
+        try:
+            session(conn)
+        except (OSError, ConnectionError) as e:
+            debug_print("Conexion perdida: " + str(e))
+        finally:
+            mv.stop_all()
+            mv.set_claw(False)
+            sockets.drop_current()
+            behaviors.state.sleeping = False
+            p.emote("sad")
+            p.say("Me desconecté. Te espero.", wait=True)
+            time.sleep(0.5)
 
 
 if __name__ == '__main__':
     try:
         main()
+    except KeyboardInterrupt:
+        pass
     finally:
+        try:
+            mv.stop_all()
+        except Exception:
+            pass
         sockets.clear()

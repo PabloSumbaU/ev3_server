@@ -1,159 +1,349 @@
+"""Motores: joystick, secuencias de instrucciones, garra y odometria.
+
+Cambios importantes respecto a la version original:
+- La garra solo se mueve cuando CAMBIA su estado. Antes, cada mensaje del
+  joystick (varios por segundo) mandaba a la garra a girar -90 grados y
+  bloqueaba el programa ~0.5 s: esa era la causa de que el joystick
+  respondiera lento (el famoso "0.6 s y no se por que" del codigo anterior).
+- Las instrucciones de voz y los comportamientos corren en un hilo aparte
+  (Runner) y se pueden cancelar: mover el joystick o el comando "s" (parar)
+  detiene cualquier secuencia al instante.
+- La odometria se calcula con los encoders de los motores, asi funciona igual
+  con joystick, voz o comportamientos.
+- Freno de seguridad: si el sensor IR detecta algo muy cerca, no deja avanzar.
+Compatible con Python 3.5.
+"""
 import math
 import threading
 import time
-from ev3dev2.motor import MoveJoystick, MoveTank, MediumMotor, SpeedPercent, OUTPUT_A, OUTPUT_B, OUTPUT_C
 
+from ev3dev2.motor import (LargeMotor, MediumMotor, MoveJoystick, MoveTank,
+                           SpeedPercent, OUTPUT_A, OUTPUT_B, OUTPUT_C)
+
+import config
 from utils import debug_print
-import sockets
 
-instruction_mapping = {
-    "f": (-100, -100),  # forward
-    "b": (100, 100),    # backward
-    "r": (-100, 100),   # right
-    "l": (100, -100),   # left
-    "p": True,          # pickup
-    "d": False,         # drop
-    "t": (-100, 100)    # turn
-}
+# Las orugas estan montadas al reves: velocidad NEGATIVA = avanzar.
+FORWARD = -1
 
-def cms_to_deg(cms):
-    return round(cms/0.02618)
+_left_port = OUTPUT_B
+_right_port = OUTPUT_A
+_claw_port = OUTPUT_C
 
-def compute_deg_for_distance(distance: float, unit: str):
-    if unit == "m":
-        distance = distance * 100
+_tank = MoveTank(_left_port, _right_port)
+_joy = MoveJoystick(_left_port, _right_port)
+_left = LargeMotor(_left_port)
+_right = LargeMotor(_right_port)
+_claw = MediumMotor(_claw_port)
 
-    return cms_to_deg(distance)
+_motor_lock = threading.RLock()
 
-_left_motor = OUTPUT_B
-_right_motor = OUTPUT_A
-_claw = OUTPUT_C
 
-_joystick_move = MoveJoystick(_left_motor, _right_motor)
-_instruction_move = MoveTank(_left_motor, _right_motor)
-_claw = MediumMotor(_claw)
+# ====================================================================== estado
+class _State:
+    def __init__(self):
+        self.claw_closed = False
+        self.last_activity = time.time()
+        self.forward_blocked = False   # lo activa el freno de seguridad
+        self.joystick_active = False
 
-def claw(b):
-        if b:
-            _claw.on(SpeedPercent(25))
-        else:
-            _claw.off(False)
-            _claw.on_for_degrees(SpeedPercent(25), -90)
 
-def stop():
-    _joystick_move.off()
+state = _State()
 
-timer = None
 
-def joystick(x, y, radius=1):
-    x = -x
+def touch():
+    '''Marca que el robot hizo algo (para saber cuanto tiempo lleva quieto).'''
+    state.last_activity = time.time()
 
-    global timer
-    if timer is not None:
-        now = time.time()
-        temp = now - timer
-        timer = now
 
-        debug_print(temp)
-    else:
-        timer = time.time()
+def idle_seconds():
+    if runner.busy or state.joystick_active:
+        return 0.0
+    return time.time() - state.last_activity
 
-    _joystick_move.on(x, y, radius)
-    l_speed, r_speed = odometer.get_speed_joystick(x, y, radius)
-    odometer.update_position(l_speed, r_speed)
 
-def interpret(instruction: str):
-    params = instruction.split("-")
+# ====================================================================== runner
+class Runner:
+    '''Ejecuta trabajos (secuencias de instrucciones o comportamientos) en un
+    hilo aparte para no bloquear la recepcion de mensajes.'''
 
-    order = params[0]
+    def __init__(self):
+        self._cancel = threading.Event()
+        self._jobs = []
+        self._cond = threading.Condition()
+        self.busy = False
+        self.current_name = ""
+        self.stop_on_cancel = True
 
-    if len(params) == 1:
-        if(order == 'p' or order == 'd'):
-            claw(instruction_mapping[order])
-            return
-        elif order == 'l' or order == 'r':
-            value = 0.75
-            unit = 's'
-    else:
-        value = float(params[1])
-        unit = params[2]
+    def start(self):
+        t = threading.Thread(target=self._loop)
+        t.daemon = True
+        t.start()
 
-    speeds = instruction_mapping[order]
+    def submit(self, fn, name="", replace=True):
+        '''Agrega un trabajo. replace=True cancela lo que se este ejecutando.'''
+        if replace:
+            self.cancel_all(stop_motors=True)
+        with self._cond:
+            self._jobs.append((fn, name))
+            self._cond.notify()
 
-    if unit != "s":
-        degrees = compute_deg_for_distance(value, unit) if unit != "d" else value
-        _instruction_move.on_for_degrees(speeds[0], speeds[1], degrees)
-    else:
-        debug_print("speeds ", speeds)
-        _instruction_move.on_for_seconds(speeds[0], speeds[1], value)
+    def cancel_all(self, stop_motors=True):
+        with self._cond:
+            del self._jobs[:]
+        self.stop_on_cancel = stop_motors
+        if self.busy:
+            self._cancel.set()
+        if stop_motors:
+            stop_wheels()
 
-#TODO: Send position when operating under voice instructions too
-# This mostly seems to work, but it's not perfect. Can't verify positional and angle data until the map is debugged in the app
-def send_position():
-    try:
+    def cancelled(self):
+        return self._cancel.is_set()
+
+    def _loop(self):
         while True:
-            data = str(odometer.x) + ";" + str(odometer.y) + ";" + str(odometer.theta) + sockets.message_end
-            #debug_print("\nSent: " + data + "\n")
-            sockets.emitters.position.send(data.encode())
-    except ConnectionError:
-        sockets.clear()
+            with self._cond:
+                while not self._jobs:
+                    self._cond.wait()
+                fn, name = self._jobs.pop(0)
+                self._cancel.clear()
+                self.busy = True
+                self.current_name = name
+            try:
+                fn()
+            except Exception as e:
+                debug_print("Error ejecutando '" + name + "': " + str(e))
+            finally:
+                self.busy = False
+                self.current_name = ""
+                touch()
 
-def start_tracking():
-    sensor_thread = threading.Thread(target=send_position)
-    sensor_thread.daemon = True
-    sensor_thread.start()
 
+runner = Runner()
+
+
+def cancelled():
+    return runner.cancelled()
+
+
+def wait(seconds):
+    '''Espera cancelable. Devuelve False si se cancelo.'''
+    end = time.time() + seconds
+    while time.time() < end:
+        if runner.cancelled():
+            return False
+        time.sleep(0.03)
+    return True
+
+
+# ====================================================================== motores
+def stop_wheels():
+    with _motor_lock:
+        try:
+            _tank.off(brake=True)
+        except Exception as e:
+            debug_print("Error al detener: " + str(e))
+
+
+def _motors_running():
+    try:
+        return _left.is_running or _right.is_running
+    except Exception:
+        return False
+
+
+def _wait_motion(max_seconds):
+    '''Espera a que terminen los motores, cancelable y con limite de tiempo.'''
+    time.sleep(0.05)
+    end = time.time() + max_seconds
+    while _motors_running() and time.time() < end:
+        if runner.cancelled():
+            if runner.stop_on_cancel:
+                stop_wheels()
+            return False
+        if state.forward_blocked and _moving_forward():
+            stop_wheels()
+            return False
+        time.sleep(0.03)
+    return not runner.cancelled()
+
+
+def _moving_forward():
+    try:
+        return _left.speed * FORWARD > 50 and _right.speed * FORWARD > 50
+    except Exception:
+        return False
+
+
+def tank_degrees(left_pct, right_pct, motor_degrees):
+    '''Mueve cada oruga motor_degrees grados (cancelable).'''
+    if runner.cancelled() or motor_degrees <= 0:
+        return False
+    if state.forward_blocked and left_pct * FORWARD > 0 and right_pct * FORWARD > 0:
+        return False
+    touch()
+    with _motor_lock:
+        if runner.cancelled():
+            return False
+        _tank.on_for_degrees(SpeedPercent(left_pct), SpeedPercent(right_pct), motor_degrees,
+                             brake=True, block=False)
+    pct = max(abs(left_pct), abs(right_pct), 1)
+    expected = motor_degrees / (pct / 100.0 * 1000.0)   # ~1000 grados/s al 100%
+    return _wait_motion(expected * 2 + 2)
+
+
+def tank_seconds(left_pct, right_pct, seconds):
+    if runner.cancelled() or seconds <= 0:
+        return False
+    if state.forward_blocked and left_pct * FORWARD > 0 and right_pct * FORWARD > 0:
+        return False
+    touch()
+    with _motor_lock:
+        if runner.cancelled():
+            return False
+        _tank.on_for_seconds(SpeedPercent(left_pct), SpeedPercent(right_pct), seconds,
+                             brake=True, block=False)
+    return _wait_motion(seconds + 2)
+
+
+def cm_to_motor_deg(cm):
+    return abs(cm) / config.CM_PER_MOTOR_DEG
+
+
+def robot_deg_to_motor_deg(robot_degrees):
+    '''Grados que debe girar cada motor para que el robot gire robot_degrees en el sitio.'''
+    arc_cm = math.pi * config.TRACK_WIDTH_CM * abs(robot_degrees) / 360.0
+    return cm_to_motor_deg(arc_cm) * config.TURN_CALIBRATION
+
+
+def drive_cm(cm, speed=None):
+    '''cm > 0 avanza, cm < 0 retrocede.'''
+    speed = speed or config.COMMAND_SPEED
+    sign = FORWARD if cm >= 0 else -FORWARD
+    return tank_degrees(sign * speed, sign * speed, cm_to_motor_deg(cm))
+
+
+def drive_seconds(seconds, forward=True, speed=None):
+    speed = speed or config.COMMAND_SPEED
+    sign = FORWARD if forward else -FORWARD
+    return tank_seconds(sign * speed, sign * speed, seconds)
+
+
+def turn(robot_degrees, speed=None):
+    '''robot_degrees > 0 gira a la derecha, < 0 a la izquierda.'''
+    speed = speed or config.COMMAND_SPEED
+    if robot_degrees >= 0:   # derecha: oruga izq. avanza, der. retrocede
+        l, r = FORWARD * speed, -FORWARD * speed
+    else:
+        l, r = -FORWARD * speed, FORWARD * speed
+    return tank_degrees(l, r, robot_deg_to_motor_deg(robot_degrees))
+
+
+def turn_seconds(seconds, right=True, speed=None):
+    speed = speed or config.COMMAND_SPEED
+    if right:
+        l, r = FORWARD * speed, -FORWARD * speed
+    else:
+        l, r = -FORWARD * speed, FORWARD * speed
+    return tank_seconds(l, r, seconds)
+
+
+# ====================================================================== garra
+def set_claw(closed):
+    '''Cierra (True) o abre (False) la garra. Solo actua si cambia el estado.'''
+    if closed == state.claw_closed:
+        return
+    state.claw_closed = closed
+    touch()
+    try:
+        if closed:
+            _claw.on(SpeedPercent(config.CLAW_SPEED))   # aprieta y mantiene
+        else:
+            _claw.off(brake=False)
+            _claw.on_for_degrees(SpeedPercent(config.CLAW_SPEED), -config.CLAW_RELEASE_DEG, block=False)
+    except Exception as e:
+        debug_print("Error garra: " + str(e))
+
+
+# ====================================================================== joystick
+def joystick(x, y, radius=1.0):
+    '''x, y en [-1, 1] tal como los envia la app.'''
+    x = -x
+    if x == 0 and y == 0:
+        joystick_stop()
+        return
+
+    if runner.busy:          # el operador siempre tiene prioridad
+        runner.cancel_all(stop_motors=False)
+
+    length = min(math.sqrt(x * x + y * y), radius)
+    angle = math.degrees(math.atan2(y, x))
+    if angle < 0:
+        angle += 360
+    l0, r0 = MoveJoystick.angle_to_speed_percentage(angle)
+    l = l0 * length / radius
+    r = r0 * length / radius
+
+    if state.forward_blocked and l * FORWARD > 5 and r * FORWARD > 5:
+        joystick_stop()
+        return
+
+    state.joystick_active = True
+    touch()
+    with _motor_lock:
+        _tank.on(SpeedPercent(l), SpeedPercent(r))
+
+
+def joystick_stop():
+    state.joystick_active = False
+    touch()
+    stop_wheels()
+
+
+def stop_all():
+    runner.cancel_all(stop_motors=True)
+    state.joystick_active = False
+
+
+# ====================================================================== odometria
 class Odometer:
-    wheel_distance = 15.5 # cm
-    # This value came from averaging the time between (19) calls of the joystick function
-    # I do not know why it takes 0.6 seconds on average to call it, but such is life
-    delta_t = 0.60753235064055 # seconds
-    # This is the approximate distance traveled when both motors operate at 100% speed for 1 second
-    distance = 24.2
-    unit = 30 # cm
+    '''Posicion estimada con los encoders. Unidades de salida: 1 = 30 cm
+    (igual que antes, para que el mapa de la app siga funcionando).'''
+    unit = 30.0
 
     def __init__(self):
         self.x = 0.0
         self.y = 0.0
         self.theta = 0.0
+        self._last = None
 
-    def get_speed_joystick(self, x, y, radius):
-        vector_length = math.sqrt((x * x) + (y * y))
-        angle = math.degrees(math.atan2(y, x))
+    def update(self):
+        try:
+            lp, rp = _left.position, _right.position
+        except Exception:
+            return
+        if self._last is None:
+            self._last = (lp, rp)
+            return
+        dl = (lp - self._last[0]) * FORWARD * config.CM_PER_MOTOR_DEG
+        dr = (rp - self._last[1]) * FORWARD * config.CM_PER_MOTOR_DEG
+        self._last = (lp, rp)
+        d = (dl + dr) / 2.0
+        dtheta = (dr - dl) / config.TRACK_WIDTH_CM
+        self.x += d * math.cos(self.theta + dtheta / 2.0) / self.unit
+        self.y += d * math.sin(self.theta + dtheta / 2.0) / self.unit
+        self.theta += dtheta
 
-        if angle < 0:
-            angle += 360
+    def as_message(self):
+        return "{:.4f};{:.4f};{:.4f}".format(self.x, self.y, self.theta)
 
-        if vector_length > radius:
-            vector_length = radius
-
-        (init_left_speed_percentage, init_right_speed_percentage) = MoveJoystick.angle_to_speed_percentage(angle)
-
-        left_speed_percentage = (init_left_speed_percentage * vector_length) / radius
-        right_speed_percentage = (init_right_speed_percentage * vector_length) / radius
-
-        return self.speed_to_cms(left_speed_percentage), self.speed_to_cms(right_speed_percentage)
-
-    def update_position(self, v_left, v_right):
-        v = (v_left + v_right) / 2
-        omega = (v_right - v_left) / self.wheel_distance
-        delta_theta = omega * self.delta_t
-
-        delta_x = v * math.cos(self.theta + delta_theta / 2) * self.delta_t
-        delta_y = v * math.sin(self.theta + delta_theta / 2) * self.delta_t
-
-        debug_print("\nOmega: " + str(omega))
-        debug_print("delta_x: " + str(delta_x) + " delta_y: " + str(delta_y) + " delta_theta: " + str(delta_theta) + "\n")
-
-        # delta_x and delta_y are in cm
-        # Divide by unit to normalize it, so every unit is equal to 30 cm
-        self.x += delta_x / self.unit
-        self.y += delta_y / self.unit
-        self.theta += delta_theta
-
-        return self.x, self.y, self.theta
-
-    def speed_to_cms(self, speed):
-        return speed / 100 * self.distance
 
 odometer = Odometer()
+
+
+def moving_forward():
+    return _moving_forward()
+
+
+def start():
+    runner.start()

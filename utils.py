@@ -1,9 +1,19 @@
 import sys
 import os
+import subprocess
 
-from ev3dev2.sound import Sound
+import config
 
-SOUND = Sound()
+_sound = None
+
+
+def _get_sound():
+    global _sound
+    if _sound is None:
+        from ev3dev2.sound import Sound
+        _sound = Sound()
+    return _sound
+
 
 class _ErrorPrinter:
     def __init__(self, *files):
@@ -18,16 +28,18 @@ class _ErrorPrinter:
         for f in self.files:
             f.flush()
 
+
 _log_file = open("log.txt", 'w')
 _printer = _ErrorPrinter(sys.stderr, _log_file)
 sys.stderr = _printer
 
-def debug_print(*args, **kwargs):
-    '''Print debug messages to stderr.
 
-    This shows up in the output panel in VS Code.
+def debug_print(*args, **kwargs):
+    '''Imprime mensajes de depuracion en stderr y en log.txt.
+
+    En VS Code aparece en el panel de salida.
     '''
-    print(*args, **kwargs, file=sys.stderr)
+    print(*args, file=sys.stderr, **kwargs)
 
 
 def reset_console():
@@ -50,8 +62,28 @@ def set_font(name):
     '''
     os.system('setfont ' + name)
 
+
+def get_ip_addresses():
+    '''Devuelve las IP del robot (excepto localhost) como lista de strings.'''
+    try:
+        out = subprocess.check_output(["hostname", "-I"]).decode().split()
+        ips = [ip for ip in out if not ip.startswith("127.") and ":" not in ip]
+        if ips:
+            return ips
+    except Exception as e:
+        debug_print("hostname -I fallo: " + str(e))
+
+    try:
+        import socket
+        return [socket.gethostbyname(socket.gethostname())]
+    except Exception:
+        return ["?"]
+
+
 def speak_es(text: str) -> None:
-    SOUND.speak(text, "-ves -b1")
+    '''Compatibilidad con el codigo anterior. Mejor usar personality.say().'''
+    _get_sound().speak(text, espeak_opts=config.VOICE_OPTS)
+
 
 def beep() -> None:
-    SOUND.beep()
+    _get_sound().beep()
